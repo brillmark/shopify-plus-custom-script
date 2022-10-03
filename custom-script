@@ -1,0 +1,892 @@
+# ================================================================
+# FreeGiftWithPurchaseRestrictions
+#
+# Limit to 1 of the free gift, only when domestic
+# ================================================================
+class FreeGiftWithPurchaseRestrictions
+  def to_s
+    "PercentOff Rule"
+  end
+  
+  def should_run(cart)
+    true
+  end
+  
+  def run(cart)
+    FREE_GIFT_TAG = "Free Gift"
+    SPEND_THRESHOLD = 2999
+
+    # Tally ineligible spend - price of gift, plus any gift cards
+    ineligible_spend = Money.new(cents: 0)
+    cart.line_items.each do |line_item|
+      if line_item.variant.product.tags.include?(FREE_GIFT_TAG)
+        if line_item.properties.has_key?("_fgwp")
+          ineligible_spend += line_item.line_price
+        end
+      end
+      if line_item.variant.product.gift_card?
+        ineligible_spend += line_item.line_price
+      end
+    end
+    
+    # Discount FGWP
+    discounted_fgwp_item = false
+    has_fgwp_item = false
+    cart.line_items.each do |line_item|
+      if line_item.variant.product.tags.include?(FREE_GIFT_TAG) and !has_fgwp_item
+        if line_item.properties.has_key?("_fgwp") 
+          if (cart.subtotal_price - ineligible_spend) >= Money.new(cents: SPEND_THRESHOLD) then
+            if line_item.quantity > 1 then
+              puts "splitting"
+              discounted_fgwp_item = line_item.split({ take: 1 })
+              discounted_fgwp_item.change_line_price(Money.zero, message: "Special Offer")
+            else
+              line_item.change_line_price(Money.zero, message: "Special Offer")
+            end
+            has_fgwp_item = true
+          else 
+            index = cart.line_items.find_index(line_item)
+            cart.line_items.delete_at(index)
+          end
+        end
+      end
+    end
+    if discounted_fgwp_item then
+      cart.line_items << discounted_fgwp_item
+    end
+  end
+end
+
+# ==================================================================
+# 'PercentOff' Rule (17/05/22)
+# ------------------------------------------------------------------
+# X% off sitewide
+# ==================================================================
+class PercentOff
+  def to_s
+    "PercentOff Rule"
+  end
+  
+  def should_run(cart)
+    true
+  end
+  
+  def run(cart)
+    DISCOUNT_PERCENT = 15
+    MESSAGE = "15% Off Sitewide for Father's Day"
+
+    discount_amount = 1 - (DISCOUNT_PERCENT * 0.01)
+    cart.line_items.each do |line_item|
+      if line_item.variant.product.id == 6239034933441
+        if cart.discount_code and cart.discount_code.code == "FREEMASK"
+          next
+        end
+      end
+      if line_item.line_price == Money.zero
+        next
+      end
+      new_line_price = line_item.line_price * discount_amount
+      line_item.change_line_price(new_line_price, message: MESSAGE)
+    end
+  end
+end
+
+# ==================================================================
+# 'FreeGift' Rule (17/05/22)
+# ------------------------------------------------------------------
+# Make product free!
+# ==================================================================
+class FreeGift
+  def to_s
+    "FreeGift Rule"
+  end
+  
+  def should_run(cart)
+    false
+  end
+  
+  def run(cart)
+    VARIANT_FREE_GIFT = 38019966271681
+    if cart.line_items.size <= 1
+      return
+    end
+    
+    cart.line_items.each do |line_item|
+      if line_item.variant.id == VARIANT_FREE_GIFT
+        if line_item.quantity > 1
+          new_line_item = line_item.split(take: 1)
+          new_line_item.change_line_price(Money.new(cents: 0), message: "Free Gift! A")
+          cart.line_items << new_line_item
+        else 
+          line_item.change_line_price(Money.new(cents: 0), message: "Free Gift! B")
+        end
+      end
+    end
+  end
+end
+
+
+# ==================================================================
+# 'BundleDiscounts' Rule (15/07/21)
+# ------------------------------------------------------------------
+# Apply special discounts to bundles. The trigger for this is a
+# product in the cart with tag 'Bundle Parent', which will cause
+# any other products with the tag 'Bundle Discount: XX%' to be
+# discounted by that amount.
+# ==================================================================
+class BundleDiscounts
+  def to_s
+    "BundleDiscounts Rule"
+  end
+  
+  def should_run(cart)
+    true
+  end
+  
+  def run(cart)
+    TAG_BUNDLE_IDENTIFIER = "Bundle Parent"
+
+    products_with_bundle_identifier = 0
+    cart.line_items.each do |line_item|
+      if line_item.variant.product.tags.include?(TAG_BUNDLE_IDENTIFIER)
+        products_with_bundle_identifier = products_with_bundle_identifier + line_item.quantity
+      end
+    end
+    if products_with_bundle_identifier > 0
+      cart.line_items.each do |line_item|
+        next if line_item.variant.product.tags.include?(TAG_BUNDLE_IDENTIFIER)
+        bundle_discount = false
+        line_item.variant.product.tags.each do | tag |
+          if tag.include?("Bundle Discount:")
+            bundle_discount = tag.gsub("Bundle Discount:", "").gsub("%", "").to_i
+            bundle_discount = bundle_discount / 100.0
+          end
+        end
+        if bundle_discount != false
+          if line_item.quantity <= products_with_bundle_identifier
+            new_line_price = line_item.line_price - (line_item.line_price * bundle_discount)
+            line_item.change_line_price(new_line_price, message: "Bundle Discount!")
+          else
+            new_line_item = line_item.split(take: products_with_bundle_identifier)
+            new_line_price = line_item.line_price - (line_item.line_price * bundle_discount)
+            cart.line_items << new_line_item
+          end
+        end
+      end
+    end
+  end
+end
+
+# ==================================================================
+# Helper Classes Used by Rules
+# ==================================================================
+class ProductWithUpsell
+  def initialize(product)
+    @product = product
+    @upsell_handle = nil
+    @upsell_handle_alt = nil
+    process()
+  end
+
+  def product
+    @product
+  end
+  
+  def handles
+    [@upsell_handle, @upsell_handle_alt]
+  end
+  
+  def process()
+    product.tags.each do |product_tag|
+      if product_tag.start_with?("Upsell Handle: ")
+        @upsell_handle = product_tag.sub("Upsell Handle: ", "")
+      end
+      if product_tag.start_with?("Upsell Alt Handle: ")
+        @upsell_handle_alt = product_tag.sub("Upsell Alt Handle: ", "")
+      end
+    end
+  end
+end
+
+# ==================================================================
+# 'PillowBundles' Rule
+# ------------------------------------------------------------------
+# Discount pairs of pillows to the 'bundle' price
+# ==================================================================
+class PillowBundles
+  
+  def to_s
+    "PillowBundles Rule"
+  end
+  
+  def should_run(cart)
+    false
+  end
+  
+  def run(cart)
+    PILLOW_PRODUCT_ID = 2150891683958
+    PILLOWS_TO_DISCOUNT = 0
+    DISCOUNT_MESSAGE = "Trtl Pillow Bundle"
+    DISCOUNT_AMOUNT = 299.5 # Per pillow discount in pence / cents / yen etc.
+    
+    # Find out how many pillows we actually have in the cart
+    cart.line_items.each do |line_item|
+      product = line_item.variant.product
+      
+      # Check we're the specified pillow, and that we're NOT a bundle (slash in title)
+      next unless product.id == PILLOW_PRODUCT_ID
+      next if line_item.variant.title.include?("/")
+      
+      PILLOWS_TO_DISCOUNT += line_item.quantity
+    end
+    
+    # We only discount multiples of 2 - the remainder is at full price
+    PILLOWS_TO_DISCOUNT -= PILLOWS_TO_DISCOUNT % 2 
+    
+    # Apply discount
+    cart.line_items.each do |line_item|
+      next if PILLOWS_TO_DISCOUNT <= 0
+      product = line_item.variant.product
+      
+      # Check we're the specified pillow, and that we're NOT a bundle (slash in title)
+      next unless product.id == PILLOW_PRODUCT_ID
+      next if line_item.variant.title.include?("/")
+      
+      # Can we discount the whole line item, or need to split?
+      if line_item.quantity <= PILLOWS_TO_DISCOUNT
+        # Great, line item quantity less than how many we have to discount. Discount em all
+        line_item.change_line_price(line_item.line_price - Money.new(cents: DISCOUNT_AMOUNT * line_item.quantity), message: DISCOUNT_MESSAGE)
+        PILLOWS_TO_DISCOUNT -= line_item.quantity
+      else
+        # We're near the end - need to split the line and discount only what's required
+        new_line_item = line_item.split(take: PILLOWS_TO_DISCOUNT)
+        new_line_item.change_line_price(new_line_item.line_price - Money.new(cents: DISCOUNT_AMOUNT * new_line_item.quantity), message: DISCOUNT_MESSAGE)
+        cart.line_items << new_line_item
+        PILLOWS_TO_DISCOUNT = 0
+      end
+    end
+  end
+end
+
+# ==================================================================
+# 'DynamicUpsell' Rule
+# ------------------------------------------------------------------
+# Discount products added via modal dynamic upsell based on tags and
+# line item properties
+# ==================================================================
+class DynamicUpsell
+  
+  def to_s
+    "DynamicUpsell Rule"
+  end
+  
+  def should_run(cart)
+    true
+  end
+  
+  def run(cart)
+    
+    # Determine what products have upsell options, and what they are
+    products_with_upsell = []
+    cart.line_items.each do |line_item|
+      if line_item.variant.product.tags.include?("Config: Has Upsell")
+        product_with_upsell = ProductWithUpsell.new(line_item.variant.product)
+        products_with_upsell.push(product_with_upsell)
+      end
+    end
+    
+    # Determine what handles we're looking for (to apply upsell discounts)
+    handles_to_search_for = products_with_upsell.map do |product_with_upsell|
+      product_with_upsell.handles
+    end
+    handles_to_search_for = handles_to_search_for.flatten - [nil]
+
+    line_items_to_append = []
+    cart.line_items.each do |line_item, index|
+      if handles_to_search_for.include?(line_item.properties["_mp_uph"])
+        # Apply discount
+        discount = false
+        line_item.variant.product.tags.each do |tag|
+          if tag.start_with?("Upsell Discount: ")
+            discount = tag.sub("Upsell Discount: ", "").to_i
+          end
+        end
+        if discount
+          # If > 1, split into new item with discount
+          if line_item.quantity > 1
+            discount_line_item = line_item.split({ take: 1 })
+            new_price = discount_line_item.line_price - Money.new(cents: discount)
+            discount_line_item.change_line_price(new_price, message: "Upgrade & Save")
+            line_items_to_append.push(discount_line_item)
+          else
+            new_price = line_item.line_price - Money.new(cents: discount)
+            line_item.change_line_price(new_price, message: "Upgrade & Save")
+          end
+        end
+      end
+    end
+    line_items_to_append.each do |line_item_to_append|
+      cart.line_items << line_item_to_append
+    end
+  end
+end
+
+# ==================================================================
+# 'LimitQuantityPerSKU' Rule
+# ------------------------------------------------------------------
+# Restrict tagged products to a given quantity
+# ==================================================================
+class LimitQuantityPerSku
+  def to_s
+    "LimitQuantityPerSKU Rule"
+  end
+  
+  def should_run(cart)
+    true
+  end
+  
+  def run(cart)
+    MAX_QTY_TAG_PREFIX = "Config: Max Qty - "
+  
+    cart.line_items.each do |line_item|
+      qty_limit = false
+      line_item.variant.product.tags.each do |tag|
+        if tag.start_with?(MAX_QTY_TAG_PREFIX)
+          qty_limit = tag.gsub(MAX_QTY_TAG_PREFIX, "").to_i
+          break
+        end
+      end
+      if qty_limit and line_item.quantity > qty_limit
+        line_item.split(take: line_item.quantity - qty_limit)
+      end
+    end
+  end
+end
+
+# Use an array to keep track of the rules desired.
+RULES = [
+  #PillowBundles.new(),
+  #DynamicUpsell.new(),
+  #LimitQuantityPerSku.new(),
+  #BundleDiscounts.new(),
+  #PercentOff.new(),
+  #FreeGift.new(),
+  FreeGiftWithPurchaseRestrictions.new()
+]
+
+# Iterate through each of the rules, apply if it should_run
+def run()
+  RULES.each do |rule|
+    if rule.should_run(Input.cart)
+      rule.run(Input.cart)
+    end
+  end
+end
+run()
+
+# Finally, update the cart based on all the rules run
+Output.cart = Input.cart
+
+
+
+
+
+
+
+#### new file 
+
+# ==================================================================
+# 'UpsellDiscounter' Rule (08/06/22)
+# ------------------------------------------------------------------
+# Apply upsell discounts to products when added via the upsell modal
+# ==================================================================
+class UpsellDiscounter
+  def to_s
+    "UpsellDiscounter Rule"
+  end
+  
+  def should_run(cart)
+    true
+  end
+  
+  def run(cart)
+    MESSAGE_PREFIX = "Bundle & Save "
+    CURRENCY_DIVIDER = 100
+    CURRENCY_SYMBOL = "$"
+    
+    allowed_discounts = {}
+    requested_discounts = []
+    
+    # First, get the allowed discounts by tag from products
+    cart.line_items.each do | line_item |
+      product_id = line_item.variant.product.id
+      line_item.variant.product.tags.each do | tag |
+        if tag.start_with?("Promote:")
+          upsell_handle = tag.split("|").first.gsub("Promote:", "").strip()
+          upsell_discount = tag.split("|").last.gsub("Discount:", "").strip()
+          is_percent = upsell_discount.include?("%")
+          allowed_discount = {
+            "handle" => upsell_handle,
+            "type" => is_percent ? "pc" : "abs",
+            "amount" => upsell_discount
+          }
+          if allowed_discounts[product_id]
+            allowed_discounts[product_id].push(allowed_discount)
+          else
+            allowed_discounts[product_id] = [allowed_discount]
+          end
+        end
+      end
+    end
+    
+    # Then, get the requested discounts from line item properties
+    cart.line_items.each do | line_item, index |
+      if line_item.properties["_up_v"]
+        requested_discount = {
+          "handle" => line_item.properties["_up_h"],
+          "type" => line_item.properties["_up_t"],
+          "amount" => line_item.properties["_up_v"]
+        }
+        
+        # requested_discount = {
+        #   "handle" => "trtl-travel-socks",
+        #   "type" => "pc",
+        #   "amount" => "10%"
+        # }
+        
+        # Validate the discount against allowed discounts
+        parent_allowed_discounts = allowed_discounts[line_item.properties["_up_p_id"].to_i()]
+        # parent_allowed_discounts = allowed_discounts[2150891683958]
+
+        if parent_allowed_discounts
+          if parent_allowed_discounts.include?(requested_discount)
+            # requested_discount["parent"] = 2150891683958
+            requested_discount["parent"] = line_item.properties["_up_p_id"]
+            requested_discounts.push(requested_discount)
+            
+            # Do the discount
+            if requested_discount["type"] == "abs"
+              # Absolute - discount by quantity * discount value
+              amount = requested_discount["amount"].to_i * line_item.quantity
+              new_price = line_item.line_price - Money.new(cents: amount)
+              line_item.change_line_price(new_price, message: "#{MESSAGE_PREFIX} #{CURRENCY_SYMBOL}#{(amount / CURRENCY_DIVIDER)}")
+            
+            elsif requested_discount["type"] == "pc"
+              # Percentage - discount line by X%
+              amount = requested_discount["amount"].gsub("%", "").to_i
+              amount = 1 - (amount * 0.01)
+              new_price = line_item.line_price * amount
+              line_item.change_line_price(new_price, message: "#{MESSAGE_PREFIX} #{requested_discount["amount"]}")
+            end
+          end
+        end
+      end
+    end
+    puts "Allowed"
+    puts allowed_discounts
+    puts "Requested & matched"
+    puts requested_discounts
+    puts "Done"
+  end
+end
+
+# ==================================================================
+# 'PercentOff' Rule (17/05/22)
+# ------------------------------------------------------------------
+# X% off sitewide
+# ==================================================================
+class PercentOff
+  def to_s
+    "PercentOff Rule"
+  end
+  
+  def should_run(cart)
+    true
+  end
+  
+  def run(cart)
+    DISCOUNT_PERCENT = 15
+    MESSAGE = "15% Off Sitewide for Father's Day"
+    
+    discount_amount = 1 - (DISCOUNT_PERCENT * 0.01)
+    cart.line_items.each do |line_item|
+      if line_item.line_price == Money.zero
+        next
+      end
+      new_line_price = line_item.line_price * discount_amount
+      line_item.change_line_price(new_line_price, message: MESSAGE)
+    end
+  end
+end
+
+# Use an array to keep track of the rules desired.
+RULES = [
+  # PercentOff.new(),
+  UpsellDiscounter.new()
+]
+
+# Iterate through each of the rules, apply if it should_run
+def run()
+  RULES.each do |rule|
+    if rule.should_run(Input.cart)
+      rule.run(Input.cart)
+    end
+  end
+end
+
+run()
+
+# Finally, update the cart based on all the rules run# ==================================================================
+# Helper Classes Used by Rules
+# ==================================================================
+class ProductWithUpsell
+  def initialize(product)
+    @product = product
+    @upsell_handle = nil
+    @upsell_handle_alt = nil
+    process()
+  end
+
+  def product
+    @product
+  end
+  
+  def handles
+    [@upsell_handle, @upsell_handle_alt]
+  end
+  
+  def process()
+    product.tags.each do |product_tag|
+      if product_tag.start_with?("Upsell Handle: ")
+        @upsell_handle = product_tag.sub("Upsell Handle: ", "")
+      end
+      if product_tag.start_with?("Upsell Alt Handle: ")
+        @upsell_handle_alt = product_tag.sub("Upsell Alt Handle: ", "")
+      end
+    end
+  end
+end
+
+# ==================================================================
+# 'PillowBundles' Rule
+# ------------------------------------------------------------------
+# Discount pairs of pillows to the 'bundle' price
+# ==================================================================
+class PillowBundles
+  
+  def to_s
+    "PillowBundles Rule"
+  end
+  
+  def should_run(cart)
+    true
+  end
+  
+  def run(cart)
+    PILLOW_PRODUCT_ID = 2150891683958
+    PILLOWS_TO_DISCOUNT = 0
+    DISCOUNT_MESSAGE = "Trtl Pillow Bundle"
+    DISCOUNT_AMOUNT = 299.5 # Per pillow discount in pence / cents / yen etc.
+    
+    # Find out how many pillows we actually have in the cart
+    cart.line_items.each do |line_item|
+      product = line_item.variant.product
+      
+      # Check we're the specified pillow, and that we're NOT a bundle (slash in title)
+      next unless product.id == PILLOW_PRODUCT_ID
+      next if line_item.variant.title.include?("/")
+      
+      PILLOWS_TO_DISCOUNT += line_item.quantity
+    end
+    
+    # We only discount multiples of 2 - the remainder is at full price
+    PILLOWS_TO_DISCOUNT -= PILLOWS_TO_DISCOUNT % 2 
+    
+    # Apply discount
+    cart.line_items.each do |line_item|
+      next if PILLOWS_TO_DISCOUNT <= 0
+      product = line_item.variant.product
+      
+      # Check we're the specified pillow, and that we're NOT a bundle (slash in title)
+      next unless product.id == PILLOW_PRODUCT_ID
+      next if line_item.variant.title.include?("/")
+      
+      # Can we discount the whole line item, or need to split?
+      if line_item.quantity <= PILLOWS_TO_DISCOUNT
+        # Great, line item quantity less than how many we have to discount. Discount em all
+        line_item.change_line_price(line_item.line_price - Money.new(cents: DISCOUNT_AMOUNT * line_item.quantity), message: DISCOUNT_MESSAGE)
+        PILLOWS_TO_DISCOUNT -= line_item.quantity
+      else
+        # We're near the end - need to split the line and discount only what's required
+        new_line_item = line_item.split(take: PILLOWS_TO_DISCOUNT)
+        new_line_item.change_line_price(new_line_item.line_price - Money.new(cents: DISCOUNT_AMOUNT * new_line_item.quantity), message: DISCOUNT_MESSAGE)
+        cart.line_items << new_line_item
+        PILLOWS_TO_DISCOUNT = 0
+      end
+    end
+  end
+end
+
+# ==================================================================
+# 'DynamicUpsell' Rule
+# ------------------------------------------------------------------
+# Discount products added via modal dynamic upsell based on tags and
+# line item properties
+# ==================================================================
+class DynamicUpsell
+  
+  def to_s
+    "DynamicUpsell Rule"
+  end
+  
+  def should_run(cart)
+    true
+  end
+  
+  def run(cart)
+    
+    # Determine what products have upsell options, and what they are
+    products_with_upsell = []
+    cart.line_items.each do |line_item|
+      if line_item.variant.product.tags.include?("Config: Has Upsell")
+        product_with_upsell = ProductWithUpsell.new(line_item.variant.product)
+        products_with_upsell.push(product_with_upsell)
+      end
+    end
+    
+    # Determine what handles we're looking for (to apply upsell discounts)
+    handles_to_search_for = products_with_upsell.map do |product_with_upsell|
+      product_with_upsell.handles
+    end
+    handles_to_search_for = handles_to_search_for.flatten - [nil]
+
+    line_items_to_append = []
+    cart.line_items.each do |line_item, index|
+      if handles_to_search_for.include?(line_item.properties["_mp_uph"])
+        # Apply discount
+        discount = false
+        line_item.variant.product.tags.each do |tag|
+          if tag.start_with?("Upsell Discount: ")
+            discount = tag.sub("Upsell Discount: ", "").to_i
+          end
+        end
+        if discount
+          # If > 1, split into new item with discount
+          if line_item.quantity > 1
+            discount_line_item = line_item.split({ take: 1 })
+            new_price = discount_line_item.line_price - Money.new(cents: discount)
+            discount_line_item.change_line_price(new_price, message: "Upgrade & Save")
+            line_items_to_append.push(discount_line_item)
+          else
+            new_price = line_item.line_price - Money.new(cents: discount)
+            line_item.change_line_price(new_price, message: "Upgrade & Save")
+          end
+        end
+      end
+    end
+    line_items_to_append.each do |line_item_to_append|
+      cart.line_items << line_item_to_append
+    end
+  end
+end
+
+# Use an array to keep track of the rules desired.
+RULES = [
+  PillowBundles.new(),
+  DynamicUpsell.new()
+]
+
+# Iterate through each of the rules, apply if it should_run
+def run()
+  RULES.each do |rule|
+    if rule.should_run(Input.cart)
+      puts rule
+      rule.run(Input.cart)
+    end
+  end
+end
+run()
+
+# Finally, update the cart based on all the rules run
+Output.cart = Input.cart
+
+Output.cart = Input.cart
+
+
+
+
+##-------------------
+
+# ==================================================================
+# Helper Classes Used by Rules
+# ==================================================================
+class ProductWithUpsell
+  def initialize(product)
+    @product = product
+    @upsell_handle = nil
+    @upsell_handle_alt = nil
+    process()
+  end
+
+  def product
+    @product
+  end
+  
+  def handles
+    [@upsell_handle, @upsell_handle_alt]
+  end
+  
+  def process()
+    product.tags.each do |product_tag|
+      if product_tag.start_with?("Upsell Handle: ")
+        @upsell_handle = product_tag.sub("Upsell Handle: ", "")
+      end
+      if product_tag.start_with?("Upsell Alt Handle: ")
+        @upsell_handle_alt = product_tag.sub("Upsell Alt Handle: ", "")
+      end
+    end
+  end
+end
+
+# ==================================================================
+# 'PillowBundles' Rule
+# ------------------------------------------------------------------
+# Discount pairs of pillows to the 'bundle' price
+# ==================================================================
+class PillowBundles
+  
+  def to_s
+    "PillowBundles Rule"
+  end
+  
+  def should_run(cart)
+    true
+  end
+  
+  def run(cart)
+    PILLOW_PRODUCT_ID = 2150891683958
+    PILLOWS_TO_DISCOUNT = 0
+    DISCOUNT_MESSAGE = "Trtl Pillow Bundle"
+    DISCOUNT_AMOUNT = 299.5 # Per pillow discount in pence / cents / yen etc.
+    
+    # Find out how many pillows we actually have in the cart
+    cart.line_items.each do |line_item|
+      product = line_item.variant.product
+      
+      # Check we're the specified pillow, and that we're NOT a bundle (slash in title)
+      next unless product.id == PILLOW_PRODUCT_ID
+      next if line_item.variant.title.include?("/")
+      
+      PILLOWS_TO_DISCOUNT += line_item.quantity
+    end
+    
+    # We only discount multiples of 2 - the remainder is at full price
+    PILLOWS_TO_DISCOUNT -= PILLOWS_TO_DISCOUNT % 2 
+    
+    # Apply discount
+    cart.line_items.each do |line_item|
+      next if PILLOWS_TO_DISCOUNT <= 0
+      product = line_item.variant.product
+      
+      # Check we're the specified pillow, and that we're NOT a bundle (slash in title)
+      next unless product.id == PILLOW_PRODUCT_ID
+      next if line_item.variant.title.include?("/")
+      
+      # Can we discount the whole line item, or need to split?
+      if line_item.quantity <= PILLOWS_TO_DISCOUNT
+        # Great, line item quantity less than how many we have to discount. Discount em all
+        line_item.change_line_price(line_item.line_price - Money.new(cents: DISCOUNT_AMOUNT * line_item.quantity), message: DISCOUNT_MESSAGE)
+        PILLOWS_TO_DISCOUNT -= line_item.quantity
+      else
+        # We're near the end - need to split the line and discount only what's required
+        new_line_item = line_item.split(take: PILLOWS_TO_DISCOUNT)
+        new_line_item.change_line_price(new_line_item.line_price - Money.new(cents: DISCOUNT_AMOUNT * new_line_item.quantity), message: DISCOUNT_MESSAGE)
+        cart.line_items << new_line_item
+        PILLOWS_TO_DISCOUNT = 0
+      end
+    end
+  end
+end
+
+# ==================================================================
+# 'DynamicUpsell' Rule
+# ------------------------------------------------------------------
+# Discount products added via modal dynamic upsell based on tags and
+# line item properties
+# ==================================================================
+class DynamicUpsell
+  
+  def to_s
+    "DynamicUpsell Rule"
+  end
+  
+  def should_run(cart)
+    true
+  end
+  
+  def run(cart)
+    
+    # Determine what products have upsell options, and what they are
+    products_with_upsell = []
+    cart.line_items.each do |line_item|
+      if line_item.variant.product.tags.include?("Config: Has Upsell")
+        product_with_upsell = ProductWithUpsell.new(line_item.variant.product)
+        products_with_upsell.push(product_with_upsell)
+      end
+    end
+    
+    # Determine what handles we're looking for (to apply upsell discounts)
+    handles_to_search_for = products_with_upsell.map do |product_with_upsell|
+      product_with_upsell.handles
+    end
+    handles_to_search_for = handles_to_search_for.flatten - [nil]
+
+    line_items_to_append = []
+    cart.line_items.each do |line_item, index|
+      if handles_to_search_for.include?(line_item.properties["_mp_uph"])
+        # Apply discount
+        discount = false
+        line_item.variant.product.tags.each do |tag|
+          if tag.start_with?("Upsell Discount: ")
+            discount = tag.sub("Upsell Discount: ", "").to_i
+          end
+        end
+        if discount
+          # If > 1, split into new item with discount
+          if line_item.quantity > 1
+            discount_line_item = line_item.split({ take: 1 })
+            new_price = discount_line_item.line_price - Money.new(cents: discount)
+            discount_line_item.change_line_price(new_price, message: "Upgrade & Save")
+            line_items_to_append.push(discount_line_item)
+          else
+            new_price = line_item.line_price - Money.new(cents: discount)
+            line_item.change_line_price(new_price, message: "Upgrade & Save")
+          end
+        end
+      end
+    end
+    line_items_to_append.each do |line_item_to_append|
+      cart.line_items << line_item_to_append
+    end
+  end
+end
+
+# Use an array to keep track of the rules desired.
+RULES = [
+  PillowBundles.new(),
+  DynamicUpsell.new()
+]
+
+# Iterate through each of the rules, apply if it should_run
+def run()
+  RULES.each do |rule|
+    if rule.should_run(Input.cart)
+      puts rule
+      rule.run(Input.cart)
+    end
+  end
+end
+run()
+
+# Finally, update the cart based on all the rules run
+Output.cart = Input.cart
